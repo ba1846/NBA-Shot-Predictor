@@ -1,0 +1,421 @@
+---
+title: "Predicting NBA Shot Outcomes Through Machine Learning"
+author: "Bernard Abousleiman"
+date: "2026-03-14"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+---
+
+# Introduction
+Shooting a basketball is not a straightforward process. Many factors can cause the chances of a make to vary. The most common are if a shot is contested, off the dribble vs a catch and shoot, and the distance a shot is taken from. The goal of this project is to train a model to predict whether a shot is made based on these core variables. 
+
+We are focused on the outcome which is whether a shot is made or missed. The defender variable is how far away the closest defender is from the shooter in feet, basically teaching the model if the shot is contested. Shot_dist is the distance between the shot and the rim in feet. 
+
+The next two variables revolve around dribbling, in basketball taking a shot without dribbling the ball gives a higher chance of making it. Catch and shoots are much more favorable to players and result in more shots made. Dribble is the amount of times that the ball is dribbled by the shooter before the shot is taken. Finally, handle_time is the time in seconds that the ball is in possession of the shooter. They technically do not need to take any dribbles but there is the same correlation between having the ball longer and missing a shot. 
+
+The final two variables are considered game information surrounding the clock and timing. The first is shot_clock which displays how much time is left on the shot clock; for perspective each team has 24 seconds to shoot the ball. When the clock gets low, they rush to get a shot off which may cause some variability. The second is quarter which is the value 1-4 for which quarter the shot took place in. For any overtime, quarter will display 5+ based on how many overtimes the game goes through. 
+
+# Exploratory Data Analysis
+
+## About the data
+The dataset used in this project is the NBA Shot Logs from the 2014-15 season from Kaggle. The data has 128,000 shot attempts with 21 variables describing the information around the attempt. 
+
+**Citation:** NBA Shot Logs (2014-15 Season)
+Noelte, D. (2016). NBA shot logs [Data set]. Kaggle. https://www.kaggle.com/datasets/dansbecker/nba-shot-logs
+
+## Codebook
+Predictors selected for modeling:
+- **outcome**: Response variable = 1 if the shot was made and  0 if missed
+- **shot_dist**: Distance from the rim in feet
+- **defender**: Distance of the closest defender from the shooter in feet
+- **shot_clock**: Time on the shot clock when the shot was taken
+- **dribble**: Dribbles by the shooter prior to taking the shot
+- **handle_time**: Time that the ball was in the shooters possession prior to shooting
+- **quarter**: Quarter the shot was taken in 1-4 and 5+ for overtimes
+
+## Data Cleaning and Missingness
+
+First, I downloaded the data and placed it into the "shots" variable. I changed shot_result, our response variable, to binary (0 for miss, 1 for make). I also renamed my variables to easier names to code for simplicity.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(tidymodels)
+library(ranger)
+library(xgboost)
+library(corrplot)
+library(vip)
+```
+
+```{r cleaning, show_col_types = FALSE}
+# Downloading the Data
+shots_raw <- read_csv("~/Downloads/Final Project 131/shot_logs.csv")
+
+shots <- shots_raw %>%
+  mutate(
+    outcome = if_else(SHOT_RESULT == 'made', 1, 0),
+    pts_type = factor(PTS_TYPE)) %>%
+    
+rename(
+  shot_result = SHOT_RESULT,
+  shot_dist = SHOT_DIST,
+  defender = CLOSE_DEF_DIST,
+  shot_clock = SHOT_CLOCK,
+  dribble = DRIBBLES,
+  handle_time = TOUCH_TIME,
+  quarter = PERIOD
+)
+
+# Missingness Calculations
+colSums(is.na(shots))
+  
+# shot_clock is the only variable with missing values
+# Checking Shots From Distances
+cutoffs <- c(30, 32, 35, 40, 45)
+
+tibble(cutoff = cutoffs) %>%
+  mutate(
+    n_removed = map_int(cutoff, ~ sum(shots$shot_dist > .x)),
+    pct_removed = round(100 * n_removed / nrow(shots), 3)
+  )
+
+# Testing how many shots fall in the category >35 ft + shot_clock <= 1
+sum(shots$shot_dist > 35 & shots$shot_clock <= 1, na.rm = TRUE)
+# 8 shots
+
+# Testing how many shots fall in the category >35 ft + shot_clock <= 2
+sum(shots$shot_dist > 35 & shots$shot_clock <= 2, na.rm = TRUE)
+# 13 shots
+
+# Checking how many were removed
+sum(shots$shot_dist > 35 & is.na(shots$shot_clock))
+
+# Checking for invalid values (all should equal 0)
+sum(shots$shot_dist < 0)
+sum(shots$defender < 0)
+sum(shots$pts_type == 1)
+
+sum(shots$shot_dist > 35 & shots$shot_clock <= 1 & shots$shot_result == 1, na.rm = TRUE)
+
+# Dataset for EDA
+shots_model <- shots %>%
+  filter(!(shot_dist > 35 & (shot_clock <= 2 | is.na(shot_clock)))) %>%
+  select(outcome, pts_type, defender, shot_dist, shot_clock, dribble, handle_time, quarter) %>%
+  mutate(
+    outcome = factor(outcome, levels = c(0, 1), labels = c("missed", "made")),
+    pts_type = factor(pts_type),
+    quarter = if_else(as.numeric(as.character(quarter)) >= 5, "OT", as.character(quarter)),
+    quarter = factor(quarter)
+  )
+
+```
+First I checked missingness and shot_clock was the only one with just over 5,567 missing values. The reason for this is when a team gains posession when their is less than 24 seconds left in a quarter, the shot clock turns off. Some of these shots may be rushed and can hurt our data. The way I handled it is I removed shots from greater than 35 feet (heaves) that were taken in the final few seconds of a quarter. These are last second shots that normally can add a lot of variability because they are very rarely scored. It is worth mentioning that it removed 0.18% of our total data. Furthermore, no shots were made in our dataset over 35 feet in the final seconds of a quarter.
+
+I tested 5 distances: 30, 32, 35, 40, and 45 feet and concluded that 35 feet was a good marker. There is a select few players that shoot 32 foot shots regularly and we want those observations to stay in the dataset. The final missing shot_clock values equals 5,346 after removing the heaves.
+
+I personally wanted to exclude free throws (1 pt attempt), because they are different from a regular shot. There's no defender and there is less variables that can help us predict a make or miss. Therefore they would cause unwanted variability if left in.
+
+## Distribution of Outcomes
+
+```{r eda-outcome, fig.align ='center'}
+shots_model %>%
+  ggplot(aes(x = outcome, fill = outcome)) +
+  geom_bar() + 
+  scale_fill_manual(values = c("made" = "#2ECC71", "missed" = "#E74C3C")) +
+  labs(
+    title = "Distribution of Makes and Misses",
+    x = "Outcome",
+    y = "Amount"
+  )
+  
+prop.table(table(shots_model$outcome))
+```
+The outcome variable is imbalanced which aligns with the NBA field goal percentage that we normally see around 45%. The data holds about 45.2% of made shots and 54.7% missed shots. We will make sure to stratify on the train/test split and cross-validation folds in order to ensure both classes are represented proportionally.
+
+## Shot Distance Distribution
+```{r eda-dist, fig.align='center'}
+shots_model %>%
+  ggplot(aes(x = shot_dist, fill = outcome)) +
+  geom_histogram(binwidth = 1, position = "dodge", alpha = 0.8) +
+  scale_fill_manual(values = c("missed" = "#E74C3C", "made" = "#2ECC71")) +
+  labs(
+    title = "Shot Distance Distribution by Outcome",
+    x = "Shot Distance by Feet",
+    y = "Amount of Shots",
+    fill = "Outcome"
+  )
+
+
+```
+There's two peaks in the shot distribution, one around 3-4 feet and another at about 25 feet. These shots signify lay ups and 3 point shots as the 2014-15 season gradually moved away from mid range shots (10-20 feet). The peaks are due to the volume of shots but it's also interesting to see how shots closer to the rim have a higher make rate than every other shot. This makes sense because a lot of a taller players opt to shoot close to the hoop and can score 60-70% of attempts. Shot distance will be a solid predictor for makes and misses.
+
+## Dribbles vs Made Shot
+```{r eda-dribble, fig.align='center'}
+shots_model %>%
+  filter(dribble <= 10) %>%
+  ggplot(aes(x = factor(dribble), fill = outcome)) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(values = c("missed" = "#E74C3C", "made" = "#2ECC71")) +
+  labs(
+    title = "Shot Made + Amount of Dribbles",
+    x = "# of Dribbles",
+    y = "Percentages",
+    fill = "Outcome"
+  )
+
+
+```
+As predicted, catch and shoot attempts (0 dribbles) have the highest make rates but not by much. The data does support that off the dribble shooting makes it more difficult to score. There is an interesting aspect to 8-10 dribbles as the shot makes improve. I believe this is because many of the shots made after a lot of dribbling are layups close to the rim. The players use dribbling to attack the basket and end up scoring a higher percentage shot. This pattern supports having dribble as a predictor.
+
+
+## Correlation Matrix for Predictors
+```{r correlation matrix}
+# Correlation between shot distance and points type
+cor(as.numeric(shots_model$pts_type), shots_model$shot_dist)
+
+# Correlation Matrix for Numeric Predictors
+shots_model %>%
+  select(shot_dist, defender, shot_clock, dribble, handle_time) %>%
+  drop_na() %>%
+  cor() %>%
+  corrplot(method = "color", type = "upper", addCoef.col = "black",
+           tl.col = "black", tl.srt = 45,
+           title = "Correlation Matrix of Numeric Predictors",
+           mar = c(0, 0, 1, 0))
+
+```
+The first thing I wanted to check was the correlation between shot distance and pts type because I though it would be fairly high. It came around 0.73 which means it's probably best to remove one due to the redundancy and noise it will bring to our model. I am choosing to remove pts_type ad shot_distance will give the model more information to estimate with. Looking at the correlation matrix, dribble and handle_time have an extremely high correlation at 0.92. I will remove dribble as handle_time is a better predictor because some players may hold the ball without dribbling and then decide to shoot. This can affect a shot negatively whereas dribble wouldn't account for it. The second highest correlation is shot_dist and defender which makes sense but both predictors will be helpful. The rest show weaker negative correlations which is a good signal of strong predictors.
+
+## Selecting the Final Dataset
+```{r final-dataset}
+# Selecting our final dataset
+# Cleaning and dropping dribble and pts_type
+final_shots_model <- shots %>%
+  filter(!(shot_dist > 35 & (shot_clock <= 2 | is.na(shot_clock)))) %>%
+  select(outcome, defender, shot_dist, shot_clock, handle_time, quarter) %>%
+  mutate(
+    outcome = factor(outcome, levels = c(0, 1), labels = c("missed", "made")),
+    quarter = factor(as.character(quarter)),
+  )
+
+# Checking our final dataset
+dim(final_shots_model) # 127,835 observations with 6 variables
+colSums(is.na(final_shots_model)) # 5346 missing values in shot_clock
+
+```
+The final dataset includes 127,835 observations and 6 predictors with outcome and quarters as factors. 
+
+## Data Splitting
+```{r} 
+# Creating training/testing data
+# 80/20 split
+set.seed(145)
+split_obj <- initial_split(final_shots_model, prop = 0.80, strata = outcome)
+
+train_df <- training(split_obj)
+test_df <- testing(split_obj)
+
+cat("Training set size:", nrow(train_df), "\n")
+cat("Testing set size:", nrow(test_df), "\n")
+cat("Training outcome rate:", round(mean(train_df$outcome == "made"), 3), "\n")
+cat("Testing outcome rate:", round(mean(test_df$outcome == "made"), 3), "\n")
+```
+
+
+We split the data into 80/20 for training and testing to teach the models. The split is 102267 for training and 25568 for testing. The training set is used to train the models on specific data and then the best model we use on the testing data, fresh observations that the model hasn't seen yet. We had to make sure the split was stratified on the outcome variable to get the same make/miss ration on both sets of data. We end up getting a proportional field goal percentage at 0.453 which is what we were looking for. This keeps the training and testing sets outcomes consistent. 
+
+## Creating the Recipe and Cross Validation
+```{r recipe}
+# Creating the Recipe
+shot_recipe <- recipe(outcome ~ defender + shot_dist + shot_clock +
+                        handle_time + quarter, data = train_df) %>%
+  step_impute_median(shot_clock) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+set.seed(445)
+cv_folds <- vfold_cv(train_df, v = 10, strata = outcome)
+
+```
+
+Outcome, our response variable is a function of the five predictors. Used this step to normalize predictors and set dummy predictors. We can now move onto running the four models.
+
+With the training set, 10 cross-validation folds were used to tune each model. The idea is that we create 10 equal groups (folds) and we train the model on 9 of the folds then tested on the final fold. This is repeated 10 times so that every group gets to be the test set. After running, we average to get a reliable estimate of model performance and it avoids variability from overfitting.
+
+# Modeling the Data
+```{r log model}
+# Logistic Regression Model
+if (file.exists("~/Downloads/Final Project 131/log_res.rds")) {
+  log_res <- readRDS("~/Downloads/Final Project 131/log_res.rds")
+} else {
+  log_reg <- logistic_reg() %>%
+  set_engine("glm") %>%
+  set_mode("classification")
+
+log_wf <- workflow() %>%
+  add_recipe(shot_recipe) %>%
+  add_model(log_reg)
+
+log_res <- fit_resamples(
+  log_wf,
+  resamples = cv_folds,
+  metrics = metric_set(roc_auc, accuracy)
+)
+  saveRDS(log_res, "~/Downloads/Final Project 131/log_res.rds")
+}
+
+# Displaying Logistic Regression results
+collect_metrics(log_res)
+```
+Taking a look at the Logistic Regression model's results it correctly predicts a made shot 60.8% of the time. Since our roc_auc is 0.631 this signals that our model can predict makes just not very well. This could be because an in game basketball shot is quite noisy for reasons other than our predictors. I'm expecting the linear models to be the weakest ones. 
+
+## Elastic Net
+```{r enet model}
+# Elastic Net Model
+if (file.exists("~/Downloads/Final Project 131/en_res.rds")) {
+  en_res <- readRDS("~/Downloads/Final Project 131/en_res.rds")
+} else {
+  en_spec <- logistic_reg(penalty = tune(), mixture = tune()) %>%
+    set_engine("glmnet") %>%
+    set_mode("classification")
+
+  en_wf <- workflow() %>%
+    add_recipe(shot_recipe) %>%
+    add_model(en_spec)
+
+  en_grid <- grid_regular(
+    penalty(range = c(-4, 0)),
+    mixture(range = c(0, 1)),
+    levels = 5
+  )
+
+  en_res <- tune_grid(
+    en_wf,
+    resamples = cv_folds,
+    grid = en_grid,
+    metrics = metric_set(roc_auc, accuracy)
+  )
+  saveRDS(en_res, "~/Downloads/Final Project 131/en_res.rds")
+}
+
+# Getting the best Elastic Net model
+show_best(en_res, metric = "roc_auc")
+autoplot(en_res)
+```
+The roc_auc = 0.631 which is identical to the logistic regression model. They are consistent because both are linear models. Lower regularization gives the best performance and the best models have low penalty values signifying all our variables are important. We should see the next two models have an improved roc_auc value.
+
+
+## Random Forest
+```{r random forest}
+# Random Forest
+# Using an if/else statement so I can knit without running
+if (file.exists("~/Downloads/Final Project 131/rf_res.rds")) {
+  rf_res <- readRDS("~/Downloads/Final Project 131/rf_res.rds")
+} else {
+rf_spec <- rand_forest(mtry = tune(), trees = 500, min_n = tune()) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+rf_wf <- workflow() %>%
+  add_recipe(shot_recipe) %>%
+  add_model(rf_spec)
+
+rf_grid <- grid_regular(
+  mtry(range = c(2, 7)),
+  min_n(range = c(10, 40)),
+  levels = 4
+)
+
+rf_res <- tune_grid(
+  rf_wf,
+  resamples = cv_folds,
+  grid = rf_grid,
+  metrics = metric_set(roc_auc, accuracy)
+)
+  saveRDS(rf_res, "~/Downloads/Final Project 131/rf_res.rds")
+}
+
+# Getting the best Random Forest model
+show_best(rf_res, metric = "roc_auc")
+autoplot(rf_res)
+```
+Performance was better than the first two models but not by much. The best model had mtry = 2 meaning it preferred two variables for each split. 
+
+## Boosted Tree
+```{r boosted tree}
+# Boosted Tree
+bt_spec <- boost_tree(
+  trees = tune(),
+  learn_rate = tune(),
+  tree_depth = tune()
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+bt_wf <- workflow() %>%
+  add_recipe(shot_recipe) %>%
+  add_model(bt_spec)
+
+
+if (file.exists("~/Downloads/Final Project 131/bt_res.rds")) {
+  bt_res <- readRDS("~/Downloads/Final Project 131/bt_res.rds")
+} else {
+bt_grid <- grid_regular(
+  trees(range = c(100, 500)),
+  learn_rate(range = c(-3, -1)),
+  tree_depth(range = c(3, 6)),
+  levels = 3
+)
+
+bt_res <- tune_grid(
+  bt_wf,
+  resamples = cv_folds,
+  grid = bt_grid,
+  metrics = metric_set(roc_auc, accuracy)
+)
+  saveRDS(bt_res, "~/Downloads/Final Project 131/bt_res.rds")
+}
+
+
+# Getting the best Boosted tree model
+show_best(bt_res, metric = "roc_auc")
+autoplot(bt_res)
+```
+The Boosted Tree model gave the best value of 64.2% of values. The best configuration was 100 trees with depth 4. The auto plot shows that the best results were found when the learning rate was 0.01.
+
+## Best Model
+```{r best model}
+# Using the Best Model
+best_bt <- select_best(bt_res, metric = "roc_auc")
+
+final_wf <- finalize_workflow(bt_wf, best_bt)
+
+final_fit <- fit(final_wf, data = train_df)
+
+augment(final_fit, new_data = test_df) %>%
+  roc_auc(truth = outcome, .pred_missed)
+
+augment(final_fit, new_data = test_df) %>%
+  accuracy(truth = outcome, .pred_class)
+
+# Variable Importance
+final_fit %>%
+  extract_fit_parsnip() %>%
+  vip::vip(num_features = 5)
+
+# Performance Table
+tibble(
+  Model = c("Logistic Regression", "Elastic Net", "Random Forest", "Boosted Tree"),
+  ROC_AUC = c(0.631, 0.631, 0.637, 0.642)
+)
+```
+The best model was boosted tree and we ran it on the testing data to get a final roc_auc of 0.638. From the importance plot we can see that shot distance was by far the most important predictor for our model. Defender was a close second which is also understandable. The worst predictor is quarter which shows that the period that the game is in isn't a strong predictor.
+
+# Conclusion
+The goal of this project was to train models in predicting whether a shot is made or missed. The predictors I used acted as patterns to help give background on each observation. For the roc_auc over the four models that were trained the logistic regression yielded: 0.631, elastic net: 0.631, random forest: 0.637, and finally the best performer the boosted tree: 0.642. The final testing data yielded 0.638.
+
+Despite the results, shooting a basketball is inherently difficult to predict. Furthermore, there are many more predictors that we most likely couldn't account for. One that comes to mind is just if the shooter was rushed in taking the shot which could affect whether their form was good. Ultimately, shooting a basketball is noisy in general and some makes or misses are hard to capture through structured data. For example, some players may have a wide open layup on a fast break and all predictors point to a make but the player misses. It may be very few but it happens a few times each season. Shot distance was definitely the most important predictor from looking at the variable importance. I believe a good improvement to this project could be to incorporate a player identity variable showing their shooting percentages and even height. This information could help the model be more confident in certain players and less confident in poor shooters. Overall the model did well in predicting shot makes, a field goal is scored about 40-50% of the time but  our model got to 63.8%. Further conclusions can be drawn as to what makes a good shot in a basketball game. The data can be used to create a game plan on what the highest percentage shots are. To conclude shot data can be extremely difficult to predict but modeling with a boosted tree gave us the correct prediction 63.8% of the time.
