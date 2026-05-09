@@ -1,0 +1,65 @@
+Codebook: Predicting NBA Shot Outcomes Through Machine Learning
+Dataset: NBA Shot Logs (2014-15 Season)
+Source: Noelte, D. (2016). NBA shot logs [Data set]. Kaggle. https://www.kaggle.com/datasets/dansbecker/nba-shot-logs
+
+Total observations: 127,835 (after cleaning)
+Total variables used in modeling: 6
+
+---------------------------------------------------------------
+RESPONSE VARIABLE
+---------------------------------------------------------------
+
+outcome
+  Type: Factor (2 levels)
+  Values: "made" = shot was scored, "missed" = shot was not scored
+  Notes: Derived from original SHOT_RESULT variable. Free throws (1 pt attempts) excluded.
+
+---------------------------------------------------------------
+PREDICTOR VARIABLES
+---------------------------------------------------------------
+
+shot_dist
+  Type: Numeric (continuous)
+  Unit: Feet
+  Description: Distance between the shooter and the rim at the time of the shot.
+  Original column: SHOT_DIST
+  Notes: Shots beyond 35 feet taken in the final 2 seconds of a quarter were removed as outliers (heaves).
+
+defender
+  Type: Numeric (continuous)
+  Unit: Feet
+  Description: Distance of the closest defender from the shooter at the time of the shot.
+  Original column: CLOSE_DEF_DIST
+  Notes: Higher values indicate a more open shot (less contested).
+
+shot_clock
+  Type: Numeric (continuous)
+  Unit: Seconds
+  Description: Time remaining on the 24-second shot clock when the shot was taken.
+  Original column: SHOT_CLOCK
+  Missing values: 5,346 observations (shot clock turns off when less than 24 seconds remain in a quarter).
+  Handling: Missing values imputed with median during preprocessing.
+
+handle_time
+  Type: Numeric (continuous)
+  Unit: Seconds
+  Description: Total time the shooter possessed the ball before taking the shot.
+  Original column: TOUCH_TIME
+  Notes: Retained over dribble due to higher predictive value; captures both dribbling and stationary possession time.
+
+quarter
+  Type: Factor
+  Values: "1", "2", "3", "4", "OT" (overtime, originally 5+)
+  Description: The quarter in which the shot was taken.
+  Original column: PERIOD
+  Notes: Any period >= 5 was recoded as "OT". Dummy encoded during preprocessing.
+
+---------------------------------------------------------------
+VARIABLES CONSIDERED BUT EXCLUDED
+---------------------------------------------------------------
+
+dribble
+  Reason: Correlation of 0.92 with handle_time. handle_time was retained as the more informative predictor.
+
+pts_type
+  Reason: Correlation of 0.73 with shot_dist. Redundant given shot_dist is already included.
